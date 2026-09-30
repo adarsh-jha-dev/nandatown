@@ -19,7 +19,9 @@ import pytest
 from nandatown.sim.api import TownAPI
 from nandatown.sim.engine import Engine
 from nandatown.sim.scenario import load_bundled
-from nandatown.sim.validators import Trace, reputation_consistent
+from nandatown.sim.validators import (
+    Trace, reputation_capped, reputation_consistent,
+)
 
 CAPPED = "reputation.capped.v1"
 
@@ -98,3 +100,51 @@ def test_a_discarded_report_is_still_recorded():
         assert event.detail["delta"] == 0
         assert event.detail["observer_weight"] == 0
         assert event.detail["reason"] == "observer_has_no_settled_trade"
+
+
+# -- the companion validator --------------------------------------------
+
+
+def mixed_trace(trust_plugin: str):
+    """One observer that settled a trade, one that never did."""
+    spec = load_bundled("marketplace")
+    spec.layers["trust"] = trust_plugin
+    engine = Engine(spec)
+    for who in ("buyer-real", "slanderer"):
+        engine.layers["identity"].create(who)
+    engine.emit("town", "payment_settled", "order-x",
+                {"from": "buyer-real", "to": "seller-a", "cents": 10,
+                 "via": "escrow"})
+    TownAPI(engine, "buyer-real").rate("seller-a", "good")
+    api = TownAPI(engine, "slanderer")
+    for _ in range(5):
+        api.rate("seller-a", "bad")
+    return engine
+
+
+def test_capped_check_passes_a_capped_trace():
+    engine = mixed_trace(CAPPED)
+    stage = reputation_capped(Trace(engine.events))
+    assert stage.status == "passed", stage.note
+    assert engine.layers["trust"].score("seller-a") == 1
+
+
+def test_capped_check_names_the_full_movement_it_rejects():
+    """The note must carry the magnitude, not just the first point of it."""
+    stage = reputation_capped(Trace(mixed_trace("reputation.v1").events))
+    assert stage.status == "failed"
+    assert "-5" in stage.note, stage.note
+    assert "slanderer" in stage.note
+
+
+def test_empty_capped_check_is_missing_not_success():
+    assert reputation_capped(Trace([])).status == "not_enough_evidence"
+
+
+def test_capped_check_does_not_judge_the_reference_formula():
+    """The two checks stay separate: neither validates the other's rules."""
+    events = mixed_trace(CAPPED).events
+    # A capped trace fails the unbounded arithmetic check by construction,
+    # which is exactly why reputation_consistent was left alone.
+    assert reputation_consistent(Trace(events)).status == "failed"
+    assert reputation_capped(Trace(events)).status == "passed"
