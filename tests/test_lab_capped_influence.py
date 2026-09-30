@@ -1,17 +1,9 @@
-"""A single observer must not be able to move another agent's reputation
-without limit.
+"""A single observer must not be able to move a reputation without limit.
 
-reputation.v1 sums every receipt outcome it is handed, so influence is
-proportional to volume: one agent that never trades can drive a
-counterparty's score arbitrarily low by writing receipts in a loop, and
-reputation_consistent approves every step, because the arithmetic really
-is internally consistent. Consistency was never the property under
-attack.
-
-reputation.capped.v1 caps any one observer at a single point and gives an
-observer with no settled trade of its own no weight at all. Both halves
-matter: the cap alone still lets a crowd of fresh identities vote, and the
-weight alone still lets one established agent shout.
+reputation.v1 sums every receipt it is handed, so one agent that never
+trades can drive a counterparty's score arbitrarily low, and
+reputation_consistent approves each step. reputation.capped.v1 caps any
+one observer at 1 and gives an observer with no settled trade no weight.
 """
 
 import pytest
@@ -51,12 +43,8 @@ def test_one_observer_with_no_trade_history(trust_plugin, want):
 
 
 def test_unbounded_slander_still_satisfies_the_reference_arithmetic_check():
-    """The existing check approves the attack, so it cannot detect it.
-
-    reputation_consistent replays the +1/-1 formula and finds it correct.
-    That is a true statement about arithmetic and says nothing about
-    whether one observer should have had that much influence.
-    """
+    """reputation_consistent replays the +1/-1 formula and finds the
+    slander correct, so it cannot detect the attack."""
     engine, _ = slander("reputation.v1")
     assert reputation_consistent(Trace(engine.events)).status == "passed"
 
@@ -177,11 +165,8 @@ def test_capped_influence_scenario_passes_and_verifies(tmp_path):
 
 
 def test_unbounded_control_breaks_the_town(tmp_path):
-    """The control is identical but for the trust layer, and must fail.
-
-    The failing report is the demonstration: one voice with no trade
-    history of its own buries a seller the buyer actually paid.
-    """
+    """Identical but for the trust layer, and must fail: one voice with no
+    trade history buries a seller the buyer actually paid."""
     bundle_dir, result = run_lab("capped_influence_uncapped_control",
                                  str(tmp_path))
     stages = {s.name: s.status for s in result.stages}

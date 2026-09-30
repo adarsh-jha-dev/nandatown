@@ -187,10 +187,7 @@ class Spoofer(SimAgent):
 class Slanderer(SimAgent):
     """Files repeated bad trade receipts about a seller it never trades with.
 
-    Every report is a real attributed receipt, so nothing here is forged:
-    the attack is volume from a single voice. A trust layer that sums
-    receipts moves the target's score once per report, which is what
-    reputation.capped.v1 caps.
+    Nothing is forged; the attack is volume from a single voice.
     """
 
     def on_start(self):

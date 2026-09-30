@@ -1,5 +1,5 @@
 name: capped_influence_uncapped_control
-description: The same slander with the trust layer left at reputation.v1, which sums every receipt it is handed; the run FAILS on purpose, showing that one voice with no trade history can bury an honest seller. Swap a layer, watch the town break.
+description: The same slander with the trust layer left at reputation.v1, which sums every receipt it is handed; the run FAILS on purpose, showing that one voice with no trade history can bury an honest seller.
 seed: 42
 validator: capped_influence
 layers:

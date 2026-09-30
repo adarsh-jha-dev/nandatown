@@ -280,11 +280,7 @@ def reputation_consistent(trace: Trace) -> StageResult:
 
 
 def _settled_parties(trace: Trace, before: int) -> set[str]:
-    """Agents named on a settled payment earlier in the trace.
-
-    The bounded layer reads the same prefix when it computes an observer's
-    weight, so a replay from events.jsonl alone reaches the same answer.
-    """
+    """Agents named on a settled payment earlier in the trace."""
     parties: set[str] = set()
     for event in trace.events[:before]:
         if event.kind != "payment_settled":
@@ -298,26 +294,18 @@ def _settled_parties(trace: Trace, before: int) -> set[str]:
 
 
 def reputation_capped(trace: Trace) -> StageResult:
-    """Replay reputation.capped.v1: no one observer moves a score by more
-    than 1, and an observer with no settled trade of its own moves nothing.
+    """Replay reputation.capped.v1 over attributed receipt events.
 
-    Two separate claims are checked. First the recorded movement: the
-    deltas one observer actually caused for one subject must sum within
-    [-1, +1], and to exactly 0 when no settled payment naming that
-    observer precedes its reports. Second the recorded totals: the score
-    on each update must equal the capped formula recomputed over every
-    observer seen so far. The first is the invariant, the second is
-    integrity; a layer could satisfy either alone.
+    Two claims. The invariant: the deltas one observer caused for one
+    subject must sum within [-1, +1], and to 0 when no settled payment
+    naming that observer precedes its reports. Integrity: each recorded
+    score must equal the capped formula recomputed over the observers
+    seen so far.
 
-    This is deliberately not reputation_consistent, which replays the
-    unbounded +1/-1 sum and rejects a clamped score by construction. Both
-    checks read the same receipt attribution, and neither validates the
-    other's formula: a bundle is judged only by the one its scenario
-    selects.
-
-    Like the reference check, this tests recorded claims. It does not
-    establish that a reporter told the truth, held authority, or that a
-    settled payment reflects a real-world trade.
+    Separate from reputation_consistent, which replays the unbounded sum
+    and rejects a clamped score. This checks the recorded claim, not
+    whether a reporter told the truth, held authority, or that a settled
+    payment reflects a real trade.
     """
     updates = [event for event in trace.events
                if event.kind == "reputation_updated"]
@@ -340,10 +328,8 @@ def reputation_capped(trace: Trace) -> StageResult:
         if isinstance(record_id, str) and record_id:
             receipts.setdefault(record_id, []).append((index, event))
 
-    # The invariant first, measured over the whole trace so the note names
-    # the full movement one observer caused rather than the first point of
-    # it. Shape problems are left to the sequential replay below, which
-    # reports them precisely.
+    # Measured over the whole trace so the note names the full movement,
+    # not the first point of it. Shape problems fail in the replay below.
     moved: dict[tuple[str, str], int] = {}
     moved_ids: dict[tuple[str, str], list[str]] = {}
     weight_of: dict[str, int] = {}
@@ -377,7 +363,7 @@ def reputation_capped(trace: Trace) -> StageResult:
     if worst is not None:
         return _failed("influence_capped", worst[1], worst[2])
 
-    # observer -> subject -> net reports, recomputing the bounded totals
+    # observer -> subject -> net reports
     net: dict[str, dict[str, int]] = {}
     weights: dict[str, int] = {}
     scores: dict[str, int] = {}
@@ -440,7 +426,7 @@ def reputation_capped(trace: Trace) -> StageResult:
         subjects[subject] = subjects.get(subject, 0) + (
             1 if outcome == "good" else -1)
 
-        # Integrity: the recorded total must be the capped formula.
+        # The recorded total must equal the capped formula.
         expected = 0
         for other, other_subjects in net.items():
             if subject not in other_subjects:
@@ -468,10 +454,10 @@ def reputation_capped(trace: Trace) -> StageResult:
 
 @validator("capped_influence")
 def capped_influence(spec, trace: Trace) -> list[StageResult]:
-    """A slanderer with no trade history floods bad receipts about an
-    honest seller. The trade must still complete, the reports must really
-    be filed, no single observer may move a score by more than 1, and the
-    honest buyer's own rating must still count."""
+    """A slanderer with no trade history files repeated bad receipts about
+    an honest seller: the reports must really be filed, no one observer may
+    move a score by more than 1, the buyer's own rating must still count,
+    and the trade must still complete."""
     stages = []
     slanderers = [agent.name for agent in spec.agents
                   if agent.role == "slanderer"]
