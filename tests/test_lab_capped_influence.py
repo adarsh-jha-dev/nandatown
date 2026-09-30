@@ -8,14 +8,20 @@ reputation_consistent approves every step, because the arithmetic really
 is internally consistent. Consistency was never the property under
 attack.
 
-The first test states the bound and fails against reputation.v1. The
-second pins why the existing check cannot catch it.
+reputation.capped.v1 caps any one observer at a single point and gives an
+observer with no settled trade of its own no weight at all. Both halves
+matter: the cap alone still lets a crowd of fresh identities vote, and the
+weight alone still lets one established agent shout.
 """
+
+import pytest
 
 from nandatown.sim.api import TownAPI
 from nandatown.sim.engine import Engine
 from nandatown.sim.scenario import load_bundled
 from nandatown.sim.validators import Trace, reputation_consistent
+
+CAPPED = "reputation.capped.v1"
 
 
 def slander(trust_plugin: str, times: int = 5):
@@ -30,10 +36,14 @@ def slander(trust_plugin: str, times: int = 5):
     return engine, api
 
 
-def test_one_observer_cannot_drive_reputation_unbounded():
-    """The invariant: any one observer moves a score by at most 1."""
-    _, api = slander("reputation.v1")
-    assert api.reputation("seller-a") >= -1
+@pytest.mark.parametrize("trust_plugin,want", [
+    (CAPPED, 0),           # no settled trade: the reports carry no weight
+    ("reputation.v1", -5),  # the gap this change addresses, kept pinned
+])
+def test_one_observer_with_no_trade_history(trust_plugin, want):
+    """Five reports from one voice. Bounded moves nothing; v1 moves five."""
+    _, api = slander(trust_plugin)
+    assert api.reputation("seller-a") == want
 
 
 def test_unbounded_slander_still_satisfies_the_reference_arithmetic_check():
@@ -43,6 +53,48 @@ def test_unbounded_slander_still_satisfies_the_reference_arithmetic_check():
     That is a true statement about arithmetic and says nothing about
     whether one observer should have had that much influence.
     """
-    engine, api = slander("reputation.v1")
-    assert api.reputation("seller-a") == -5
+    engine, _ = slander("reputation.v1")
     assert reputation_consistent(Trace(engine.events)).status == "passed"
+
+
+def test_an_established_observer_is_still_capped_at_one_point():
+    """The weight rule alone would let one trading agent shout."""
+    spec = load_bundled("marketplace")
+    spec.layers["trust"] = CAPPED
+    engine = Engine(spec)
+    engine.layers["identity"].create("buyer-real")
+    engine.emit("town", "payment_settled", "order-x",
+                {"from": "buyer-real", "to": "seller-a", "cents": 10,
+                 "via": "escrow"})
+    api = TownAPI(engine, "buyer-real")
+    for _ in range(4):
+        api.rate("seller-a", "good")
+    assert api.reputation("seller-a") == 1
+    deltas = [e.detail["delta"] for e in engine.events
+              if e.kind == "reputation_updated"]
+    assert deltas == [1, 0, 0, 0], "only the first report may move the score"
+
+
+def test_distinct_observers_still_accumulate():
+    """The cap is per observer, not a cap on the score itself."""
+    spec = load_bundled("marketplace")
+    spec.layers["trust"] = CAPPED
+    engine = Engine(spec)
+    for who in ("buyer-x", "buyer-y"):
+        engine.layers["identity"].create(who)
+        engine.emit("town", "payment_settled", f"order-{who}",
+                    {"from": who, "to": "seller-a", "cents": 10,
+                     "via": "escrow"})
+        TownAPI(engine, who).rate("seller-a", "good")
+    assert engine.layers["trust"].score("seller-a") == 2
+
+
+def test_a_discarded_report_is_still_recorded():
+    """A report that did not count must not vanish from the trace."""
+    engine, _ = slander(CAPPED, times=2)
+    updates = [e for e in engine.events if e.kind == "reputation_updated"]
+    assert len(updates) == 2
+    for event in updates:
+        assert event.detail["delta"] == 0
+        assert event.detail["observer_weight"] == 0
+        assert event.detail["reason"] == "observer_has_no_settled_trade"
