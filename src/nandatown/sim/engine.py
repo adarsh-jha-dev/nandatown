@@ -30,6 +30,12 @@ class Engine:
         self.agents: dict[str, Any] = {}
         self.layers = {name: resolve(name, spec.layers[name])(self)
                        for name in LAYER_NAMES}
+        # A layer that must react to another layer's events opts in by
+        # defining on_event; every other layer is never called. A listener
+        # may emit, which nests one level and must not react to its own
+        # event kinds, or it would not terminate.
+        self._listeners = [layer.on_event for layer in self.layers.values()
+                           if callable(getattr(layer, "on_event", None))]
         self.layers["transport"].configure(
             [f.model_dump() for f in spec.faults])
         self.layers["privacy"].configure(spec.redact_fields)
@@ -43,6 +49,8 @@ class Engine:
                           at=self.now, observer=observer, kind=kind,
                           subject=subject, detail=detail or {})
         self.events.append(event)
+        for notify in self._listeners:
+            notify(event)
         return event.event_id
 
     def record_intent(self, actor: str, action: str,

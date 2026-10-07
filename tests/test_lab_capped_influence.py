@@ -334,3 +334,99 @@ def test_recorded_deltas_sum_to_the_recorded_score():
     assert sum(per_pair.values()) == engine.layers["trust"].score("seller")
     for pair, moved in per_pair.items():
         assert abs(moved) <= 1, f"{pair} moved {moved:+d}"
+
+
+def enfranchised_trace():
+    """A trace containing one enfranchisement, for tampering with."""
+    engine = lifecycle_engine()
+    TownAPI(engine, "alice").rate("seller", "bad")
+    engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
+    TownAPI(engine, "bob").rate("seller", "good")
+    return [event.model_copy(deep=True) for event in engine.events]
+
+
+def test_the_enfranchisement_is_recorded_with_its_transition():
+    events = enfranchised_trace()
+    reweights = [e for e in events if e.kind == "reputation_reweighted"]
+    assert len(reweights) == 1
+    event = reweights[0]
+    assert event.observer == "alice" and event.subject == "seller"
+    assert event.detail["observer_weight_before"] == 0
+    assert event.detail["observer_weight_after"] == 1
+    assert event.detail["score_before"] == 0
+    assert event.detail["score"] == -1
+    assert event.detail["delta"] == -1
+    assert event.detail["reason"] == "observer_weight_gained"
+    assert event.detail["formula"] == CAPPED
+    # correlated to the payment that caused it
+    payment = next(e for e in events if e.kind == "payment_settled")
+    assert event.detail["payment"] == payment.event_id
+
+
+@pytest.mark.parametrize("case,fragment", [
+    ("dropped_reweight", "with no reputation_reweighted event"),
+    # A second reweight is caught by the cap itself: alice moves -2.
+    ("duplicated_reweight", "is capped at +/-1"),
+    # Without the payment nothing enfranchised her, so the weight rule fires.
+    ("reweight_without_payment", "has no settled trade of its own"),
+    ("wrong_delta", "the capped formula gives"),
+    ("wrong_score_before", "the capped formula gives"),
+    ("wrong_score", "the capped formula gives"),
+    ("backwards_weight", "0 to 1 weight transition"),
+    ("reweight_of_an_unreported_subject", "was not owed"),
+])
+def test_capped_check_rejects_tampered_enfranchisements(case, fragment):
+    """Each new check must be the only thing standing between these and a pass."""
+    events = enfranchised_trace()
+    reweight = next(e for e in events if e.kind == "reputation_reweighted")
+
+    if case == "dropped_reweight":
+        events.remove(reweight)
+    elif case == "duplicated_reweight":
+        events.insert(events.index(reweight) + 1,
+                      reweight.model_copy(deep=True, update={"event_id": "ev-dup"}))
+    elif case == "reweight_without_payment":
+        events.remove(next(e for e in events if e.kind == "payment_settled"))
+    elif case == "wrong_delta":
+        reweight.detail["delta"] = 0
+    elif case == "wrong_score_before":
+        reweight.detail["score_before"] = -5
+    elif case == "wrong_score":
+        reweight.detail["score"] = 1
+    elif case == "backwards_weight":
+        reweight.detail.update(observer_weight_before=1,
+                               observer_weight_after=0)
+    elif case == "reweight_of_an_unreported_subject":
+        # alice filed nothing about this subject, so no weight change to it
+        # was ever owed, even though she really was enfranchised.
+        reweight.subject = "a-seller-alice-never-rated"
+
+    stage = reputation_capped(Trace(events))
+    assert stage.status == "failed", stage.note
+    assert fragment in stage.note, stage.note
+
+
+def test_an_observer_that_settles_before_reporting_needs_no_reweight():
+    """No reports on file means nothing to re-weight, so no event is owed."""
+    engine = lifecycle_engine()
+    engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
+    TownAPI(engine, "alice").rate("seller", "bad")
+    events = [event.model_copy(deep=True) for event in engine.events]
+    assert not [e for e in events if e.kind == "reputation_reweighted"]
+    assert engine.layers["trust"].score("seller") == -1
+    assert reputation_capped(Trace(events)).status == "passed"
+
+
+def test_enfranchisement_still_respects_the_cap():
+    """Retroactive weight must not let one observer exceed one point."""
+    engine = lifecycle_engine()
+    alice = TownAPI(engine, "alice")
+    for _ in range(4):
+        alice.rate("seller", "bad")
+    engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
+    assert engine.layers["trust"].score("seller") == -1
+    events = [event.model_copy(deep=True) for event in engine.events]
+    moved = sum(e.detail["delta"] for e in events
+                if e.kind in REPUTATION_KINDS and e.observer == "alice")
+    assert moved == -1, "four reports, enfranchised, still worth one point"
+    assert reputation_capped(Trace(events)).status == "passed"

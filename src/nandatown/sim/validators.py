@@ -293,27 +293,42 @@ def _settled_parties(trace: Trace, before: int) -> set[str]:
     return parties
 
 
+REWEIGHT_KIND = "reputation_reweighted"
+
+
+def _clamp1(value: int) -> int:
+    return max(-1, min(1, value))
+
+
 def reputation_capped(trace: Trace) -> StageResult:
-    """Replay reputation.capped.v1 over attributed receipt events.
+    """Replay reputation.capped.v1 from the events alone, in order.
+
+    Eligibility is current-state, so a settled payment enfranchises an
+    observer's earlier reports. The plugin records that moment as a
+    reputation_reweighted event, and this replays those transitions rather
+    than inferring a weight per update; inferring it per update is what let
+    the runtime and the verifier disagree about a retroactively enfranchised
+    report.
 
     Two claims. The invariant: the deltas one observer caused for one
-    subject must sum within [-1, +1], and to 0 when no settled payment
-    naming that observer precedes its reports. Integrity: each recorded
-    score must equal the capped formula recomputed over the observers
-    seen so far.
+    subject, across reports and reweights alike, sum within [-1, +1], and
+    to 0 for an observer no settled payment ever names. Integrity: every
+    recorded score equals the capped formula over the reports and weights
+    established earlier in the trace, and every enfranchisement that moves
+    a score carries its own event.
 
     Separate from reputation_consistent, which replays the unbounded sum
     and rejects a clamped score. This checks the recorded claim, not
     whether a reporter told the truth, held authority, or that a settled
     payment reflects a real trade.
     """
-    updates = [event for event in trace.events
-               if event.kind == "reputation_updated"]
-    update_ids = _event_ids(updates)
-    if (len(update_ids) != len(updates)
-            or len(update_ids) != len(set(update_ids))):
-        return _failed("influence_capped", update_ids,
-                       "score updates have malformed or ambiguous event IDs")
+    scored = [event for event in trace.events
+              if event.kind in ("reputation_updated", REWEIGHT_KIND)]
+    scored_ids = _event_ids(scored)
+    if (len(scored_ids) != len(scored)
+            or len(scored_ids) != len(set(scored_ids))):
+        return _failed("influence_capped", scored_ids,
+                       "score events have malformed or ambiguous event IDs")
 
     receipts: dict[str, list[tuple[int, TownEvent]]] = {}
     for index, event in enumerate(trace.events):
@@ -328,22 +343,18 @@ def reputation_capped(trace: Trace) -> StageResult:
         if isinstance(record_id, str) and record_id:
             receipts.setdefault(record_id, []).append((index, event))
 
-    # Measured over the whole trace so the note names the full movement,
-    # not the first point of it. Shape problems fail in the replay below.
+    # The invariant, over the whole trace, so the note names the full
+    # movement rather than the first point of it. Shape problems are left
+    # to the ordered replay below, which reports them precisely.
+    ever_settled = _settled_parties(trace, len(trace.events))
     moved: dict[tuple[str, str], int] = {}
     moved_ids: dict[tuple[str, str], list[str]] = {}
-    weight_of: dict[str, int] = {}
-    for index, event in enumerate(trace.events):
-        if event.kind != "reputation_updated":
-            continue
+    for event in scored:
         detail = event.detail if isinstance(event.detail, dict) else {}
         if (type(detail.get("delta")) is not int
                 or not isinstance(event.observer, str) or not event.observer
                 or not isinstance(event.subject, str) or not event.subject):
             continue
-        weight = 1 if event.observer in _settled_parties(trace, index) else 0
-        weight_of[event.observer] = max(weight_of.get(event.observer, 0),
-                                        weight)
         pair = (event.observer, event.subject)
         moved[pair] = moved.get(pair, 0) + detail["delta"]
         moved_ids.setdefault(pair, []).extend(_event_ids([event]))
@@ -353,7 +364,7 @@ def reputation_capped(trace: Trace) -> StageResult:
         if abs(total) > 1:
             note = (f"observer {observer!r} moved {subject!r} by {total:+d};"
                     f" one observer is capped at +/-1")
-        elif weight_of.get(observer, 0) == 0 and total != 0:
+        elif observer not in ever_settled and total != 0:
             note = (f"observer {observer!r} has no settled trade of its own"
                     f" but moved {subject!r} by {total:+d}")
         else:
@@ -363,17 +374,107 @@ def reputation_capped(trace: Trace) -> StageResult:
     if worst is not None:
         return _failed("influence_capped", worst[1], worst[2])
 
-    # observer -> subject -> net reports
+    # Ordered replay. Weight changes only where the trace says they did.
     net: dict[str, dict[str, int]] = {}
     weights: dict[str, int] = {}
     scores: dict[str, int] = {}
+    settled: set[str] = set()
+    # (observer, subject) enfranchisements still owed a reweight event, in
+    # the order the layer must emit them.
+    owed: list[tuple[str, str]] = []
+    owed_weight: set[str] = set()
     used: set[str] = set()
     evidence: list[str] = []
     missing_receipt = False
 
+    def owed_failure() -> StageResult:
+        observer, subject = owed[0]
+        return _failed(
+            "influence_capped", _event_ids(scored),
+            f"a settled payment enfranchised {observer!r}'s earlier report"
+            f" about {subject!r} with no {REWEIGHT_KIND} event, so the score"
+            f" it moved is not reconstructable")
+
+    def recomputed(subject: str) -> int:
+        total = 0
+        for observer, subjects in net.items():
+            if subject in subjects:
+                total += weights.get(observer, 0) * _clamp1(subjects[subject])
+        return total
+
     for index, event in enumerate(trace.events):
+        if event.kind == "payment_settled":
+            if owed:
+                return owed_failure()
+            detail = event.detail if isinstance(event.detail, dict) else {}
+            for side in ("from", "to"):
+                party = detail.get(side)
+                if (not isinstance(party, str) or not party
+                        or party in settled):
+                    continue
+                settled.add(party)
+                reported = sorted(net.get(party, {}))
+                if reported:
+                    # Weight flips as each reweight event is replayed, so a
+                    # payment naming two parties keeps their order.
+                    owed_weight.add(party)
+                    owed.extend((party, subject) for subject in reported)
+                else:
+                    weights[party] = 1
+            continue
+
+        if event.kind == REWEIGHT_KIND:
+            detail = event.detail
+            if (not isinstance(detail, dict)
+                    or not isinstance(event.observer, str)
+                    or not event.observer
+                    or not isinstance(event.subject, str) or not event.subject
+                    or type(event.at) not in (int, float)
+                    or not math.isfinite(event.at)):
+                return _failed("influence_capped", _event_ids([event]),
+                               "reweight event is malformed")
+            if not owed or owed[0] != (event.observer, event.subject):
+                expected = (f"{owed[0][0]!r} about {owed[0][1]!r}" if owed
+                            else "no pending enfranchisement")
+                return _failed(
+                    "influence_capped", [event.event_id],
+                    f"reweight of {event.observer!r} about"
+                    f" {event.subject!r} was not owed; expected {expected}")
+            owed.pop(0)
+            if event.observer in owed_weight:
+                weights[event.observer] = 1
+                owed_weight.discard(event.observer)
+            if (detail.get("observer_weight_before") != 0
+                    or detail.get("observer_weight_after") != 1
+                    or type(detail.get("delta")) is not int
+                    or type(detail.get("score")) is not int
+                    or type(detail.get("score_before")) is not int):
+                return _failed("influence_capped", [event.event_id],
+                               "reweight event does not record a readable"
+                               " 0 to 1 weight transition")
+            expected_delta = _clamp1(net[event.observer][event.subject])
+            before = scores.get(event.subject, 0)
+            after = recomputed(event.subject)
+            if (detail["score_before"] != before
+                    or detail["delta"] != expected_delta
+                    or detail["score"] != after
+                    or after - before != expected_delta):
+                return _failed(
+                    "influence_capped", [event.event_id],
+                    f"reweight of {event.observer!r} about"
+                    f" {event.subject!r} records"
+                    f" {detail['score_before']:+d} to {detail['score']:+d}"
+                    f" by {detail['delta']:+d}; the capped formula gives"
+                    f" {before:+d} to {after:+d} by {expected_delta:+d}")
+            scores[event.subject] = after
+            evidence.append(event.event_id)
+            continue
+
         if event.kind != "reputation_updated":
             continue
+        if owed:
+            return owed_failure()
+
         detail = event.detail
         if (not isinstance(detail, dict)
                 or not isinstance(event.subject, str) or not event.subject
@@ -420,19 +521,13 @@ def reputation_capped(trace: Trace) -> StageResult:
                 " receipt")
 
         observer, subject = event.observer, event.subject
-        weight = 1 if observer in _settled_parties(trace, index) else 0
-        weights[observer] = max(weights.get(observer, 0), weight)
+        if observer in settled:
+            weights.setdefault(observer, 1)
         subjects = net.setdefault(observer, {})
         subjects[subject] = subjects.get(subject, 0) + (
             1 if outcome == "good" else -1)
 
-        # The recorded total must equal the capped formula.
-        expected = 0
-        for other, other_subjects in net.items():
-            if subject not in other_subjects:
-                continue
-            capped = max(-1, min(1, other_subjects[subject]))
-            expected += weights.get(other, 0) * capped
+        expected = recomputed(subject)
         if detail["score"] != expected or detail["delta"] != (
                 expected - scores.get(subject, 0)):
             return _failed(
@@ -442,14 +537,17 @@ def reputation_capped(trace: Trace) -> StageResult:
         scores[subject] = expected
         evidence.extend(refs)
 
+    if owed:
+        return owed_failure()
+
     if not evidence or missing_receipt:
         return _missing("influence_capped",
                         "score updates or their receipt events are missing")
     return _passed(
         "influence_capped", evidence,
-        "every observer moved each score by at most 1, and observers"
-        " without a settled trade moved nothing; claim truth and reporter"
-        " authority are not tested")
+        "every observer moved each score by at most 1, observers without a"
+        " settled trade moved nothing, and each enfranchisement is recorded;"
+        " claim truth and reporter authority are not tested")
 
 
 @validator("capped_influence")
