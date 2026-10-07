@@ -237,3 +237,100 @@ def test_capped_check_rejects_tampered_traces(case, want):
         counted.detail["outcome"] = "uncertain"
 
     assert stage_of(spec, events).status == want
+
+
+# -- the enfranchisement lifecycle --------------------------------------
+#
+# Eligibility is evaluated at current state, so a settled payment makes an
+# observer's earlier reports start counting. Pins the lifecycle raised in
+# review of PR #290.
+
+
+REPUTATION_KINDS = ("reputation_updated", "reputation_reweighted")
+
+
+def lifecycle_engine():
+    """alice and bob, who will settle one cent between them, and a seller."""
+    spec = load_bundled("capped_influence")
+    engine = Engine(spec)
+    for who in ("alice", "bob", "seller"):
+        engine.layers["identity"].create(who)
+    engine.layers["payments"].open_account("alice", 10)
+    engine.layers["payments"].open_account("bob", 0)
+    return engine
+
+
+def recorded_reputation(engine):
+    return [event for event in engine.events
+            if event.kind in REPUTATION_KINDS]
+
+
+def assert_three_views_agree(engine, subject, expected, step):
+    """The plugin, the trace and the replay must report the same score.
+
+    Checked as: in-memory == newest recorded, and the validator's
+    reconstruction accepts every recorded score. Together those make all
+    three agree, since the validator reconstructs from events alone.
+    """
+    trust = engine.layers["trust"]
+    events = [event.model_copy(deep=True) for event in engine.events]
+    recorded = [event for event in events if event.kind in REPUTATION_KINDS]
+    stage = reputation_capped(Trace(events))
+
+    in_memory = trust.score(subject)
+    assert in_memory == expected, (
+        f"{step}: plugin returned {in_memory:+d}, expected {expected:+d}")
+    assert recorded, f"{step}: the score changed with nothing recorded"
+    newest = recorded[-1].detail["score"]
+    assert newest == in_memory, (
+        f"{step}: newest recorded score {newest:+d} but the plugin holds"
+        f" {in_memory:+d}; the move is invisible in the trace")
+    assert stage.status == "passed", (
+        f"{step}: replay from events alone says {stage.status}: {stage.note}")
+
+
+def test_a_late_payment_enfranchises_earlier_reports_consistently():
+    """The exact sequence from review: report, then settle, then report."""
+    engine = lifecycle_engine()
+
+    TownAPI(engine, "alice").rate("seller", "bad")
+    assert_three_views_agree(engine, "seller", 0, "alice reports unweighted")
+
+    engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
+    assert_three_views_agree(engine, "seller", -1, "alice settles one cent")
+
+    TownAPI(engine, "bob").rate("seller", "good")
+    assert_three_views_agree(engine, "seller", 0, "bob reports weighted")
+
+
+def test_replay_agrees_after_a_late_payment():
+    """The second half of the same divergence, isolated.
+
+    Even if the settle moment were silent, the validator must not
+    reconstruct a different score than the one the runtime recorded.
+    """
+    engine = lifecycle_engine()
+    TownAPI(engine, "alice").rate("seller", "bad")
+    engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
+    TownAPI(engine, "bob").rate("seller", "good")
+    events = [event.model_copy(deep=True) for event in engine.events]
+    stage = reputation_capped(Trace(events))
+    assert stage.status == "passed", stage.note
+
+
+def test_recorded_deltas_sum_to_the_recorded_score():
+    """Every move of a score must be attributable to a recorded delta."""
+    engine = lifecycle_engine()
+    TownAPI(engine, "alice").rate("seller", "bad")
+    engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
+    TownAPI(engine, "bob").rate("seller", "good")
+
+    per_pair: dict[tuple[str, str], int] = {}
+    for event in recorded_reputation(engine):
+        pair = (event.observer, event.subject)
+        per_pair[pair] = per_pair.get(pair, 0) + event.detail["delta"]
+
+    assert per_pair == {("alice", "seller"): -1, ("bob", "seller"): 1}
+    assert sum(per_pair.values()) == engine.layers["trust"].score("seller")
+    for pair, moved in per_pair.items():
+        assert abs(moved) <= 1, f"{pair} moved {moved:+d}"
