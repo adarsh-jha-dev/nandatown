@@ -10,7 +10,7 @@ import pytest
 
 from nandatown.sim.api import TownAPI
 from nandatown.bundle import verify_bundle
-from nandatown.sim.engine import Engine
+from nandatown.sim.engine import Engine, SubscriptionLoop
 from nandatown.sim.runner import build_engine, run_lab
 from nandatown.sim.scenario import load_bundled
 from nandatown.sim.validators import (
@@ -430,3 +430,58 @@ def test_enfranchisement_still_respects_the_cap():
                 if e.kind in REPUTATION_KINDS and e.observer == "alice")
     assert moved == -1, "four reports, enfranchised, still worth one point"
     assert reputation_capped(Trace(events)).status == "passed"
+
+
+# -- event subscription -------------------------------------------------
+
+
+def test_the_layer_subscribes_only_to_settled_payments():
+    engine = lifecycle_engine()
+    assert engine.layers["trust"].subscribes_to == ("payment_settled",)
+    assert set(engine._subscribers) == {"payment_settled"}
+    assert [name for name, _ in engine._subscribers["payment_settled"]] \
+        == ["trust"]
+
+
+@pytest.mark.parametrize("name", [
+    "marketplace", "auction", "voting", "consensus", "supply_chain",
+    "capability_spoofing", "capped_influence_uncapped_control",
+])
+def test_scenarios_without_the_capped_layer_subscribe_to_nothing(name):
+    assert Engine(load_bundled(name))._subscribers == {}
+
+
+def test_only_subscribed_kinds_reach_the_layer():
+    """Every other event kind must not reach on_event at all."""
+    engine = lifecycle_engine()
+    seen = []
+    engine.layers["trust"].on_event = seen.append
+    engine._subscribers["payment_settled"] = [("trust", seen.append)]
+    engine.emit("town", "card_registered", "alice", {})
+    engine.emit("town", "receipt_attested", "alice", {})
+    assert seen == []
+    engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
+    assert [event.kind for event in seen] == ["payment_settled"]
+
+
+def test_a_layer_that_re_enters_its_own_kind_is_refused():
+    """The no-loop rule is enforced, not just documented."""
+    engine = lifecycle_engine()
+
+    def loop(event):
+        engine.emit("town", "payment_settled", "again",
+                    {"from": "alice", "to": "bob", "cents": 1})
+
+    engine._subscribers["payment_settled"] = [("trust", loop)]
+    with pytest.raises(SubscriptionLoop, match="re-entered on"):
+        engine.emit("town", "payment_settled", "first",
+                    {"from": "alice", "to": "bob", "cents": 1})
+
+
+def test_a_subscriber_may_still_emit_other_kinds():
+    """Enfranchisement emits from inside a subscriber and must not trip."""
+    engine = lifecycle_engine()
+    TownAPI(engine, "alice").rate("seller", "bad")
+    engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
+    assert [e.kind for e in engine.events if e.kind == "reputation_reweighted"]
+    assert engine._dispatching == set()

@@ -16,6 +16,10 @@ from ..layers import LAYER_NAMES, resolve
 from ..records import TownEvent
 
 
+class SubscriptionLoop(Exception):
+    """A layer was re-entered for an event kind it is still handling."""
+
+
 class Engine:
     def __init__(self, spec, run_id: str | None = None):
         self.spec = spec
@@ -30,12 +34,16 @@ class Engine:
         self.agents: dict[str, Any] = {}
         self.layers = {name: resolve(name, spec.layers[name])(self)
                        for name in LAYER_NAMES}
-        # A layer that must react to another layer's events opts in by
-        # defining on_event; every other layer is never called. A listener
-        # may emit, which nests one level and must not react to its own
-        # event kinds, or it would not terminate.
-        self._listeners = [layer.on_event for layer in self.layers.values()
-                           if callable(getattr(layer, "on_event", None))]
+        # A layer reacts to another layer's events by naming the kinds it
+        # wants in subscribes_to and defining on_event.
+        self._subscribers: dict[str, list[tuple[str, Any]]] = {}
+        for name, layer in self.layers.items():
+            notify = getattr(layer, "on_event", None)
+            if not callable(notify):
+                continue
+            for kind in getattr(layer, "subscribes_to", ()):
+                self._subscribers.setdefault(kind, []).append((name, notify))
+        self._dispatching: set[tuple[str, str]] = set()
         self.layers["transport"].configure(
             [f.model_dump() for f in spec.faults])
         self.layers["privacy"].configure(spec.redact_fields)
@@ -49,8 +57,18 @@ class Engine:
                           at=self.now, observer=observer, kind=kind,
                           subject=subject, detail=detail or {})
         self.events.append(event)
-        for notify in self._listeners:
-            notify(event)
+        for name, notify in self._subscribers.get(kind, ()):
+            # A subscriber may emit. Re-entering the same layer for the same
+            # kind cannot terminate, so it is refused rather than recursed.
+            seen = (name, kind)
+            if seen in self._dispatching:
+                raise SubscriptionLoop(
+                    f"layer {name!r} re-entered on {kind!r}")
+            self._dispatching.add(seen)
+            try:
+                notify(event)
+            finally:
+                self._dispatching.discard(seen)
         return event.event_id
 
     def record_intent(self, actor: str, action: str,

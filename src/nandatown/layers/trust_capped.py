@@ -44,6 +44,8 @@ def clamp(value: int, low: int = -1, high: int = 1) -> int:
 class CappedReputation:
     """Reputation capped at +/-1 per observer, zero without trade history."""
 
+    subscribes_to = ("payment_settled",)
+
     def __init__(self, engine):
         self.engine = engine
         # observer -> subject -> net goods minus bads, unclamped
@@ -65,9 +67,9 @@ class CappedReputation:
     def on_event(self, event) -> None:
         """Enfranchise an observer the first time a payment names it.
 
-        Called by the engine for every event. Reports already on file from
-        that observer start counting here, not lazily at the next read, so
-        the score change lands in the trace at the moment that caused it.
+        Reports already on file from that observer start counting here, not
+        lazily at the next read, so the score change lands in the trace at
+        the moment that caused it.
         """
         if event.kind != "payment_settled":
             return
