@@ -240,10 +240,6 @@ def test_capped_check_rejects_tampered_traces(case, want):
 
 
 # -- the enfranchisement lifecycle --------------------------------------
-#
-# Eligibility is evaluated at current state, so a settled payment makes an
-# observer's earlier reports start counting. Pins the lifecycle raised in
-# review of PR #290.
 
 
 REPUTATION_KINDS = ("reputation_updated", "reputation_reweighted")
@@ -266,12 +262,8 @@ def recorded_reputation(engine):
 
 
 def assert_three_views_agree(engine, subject, expected, step):
-    """The plugin, the trace and the replay must report the same score.
-
-    Checked as: in-memory == newest recorded, and the validator's
-    reconstruction accepts every recorded score. Together those make all
-    three agree, since the validator reconstructs from events alone.
-    """
+    """In-memory == newest recorded, and the replay accepts every recorded
+    score, which together make all three agree."""
     trust = engine.layers["trust"]
     events = [event.model_copy(deep=True) for event in engine.events]
     recorded = [event for event in events if event.kind in REPUTATION_KINDS]
@@ -304,11 +296,7 @@ def test_a_late_payment_enfranchises_earlier_reports_consistently():
 
 
 def test_replay_agrees_after_a_late_payment():
-    """The second half of the same divergence, isolated.
-
-    Even if the settle moment were silent, the validator must not
-    reconstruct a different score than the one the runtime recorded.
-    """
+    """The replay must not reconstruct a score the runtime never recorded."""
     engine = lifecycle_engine()
     TownAPI(engine, "alice").rate("seller", "bad")
     engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
@@ -397,8 +385,7 @@ def test_capped_check_rejects_tampered_enfranchisements(case, fragment):
         reweight.detail.update(observer_weight_before=1,
                                observer_weight_after=0)
     elif case == "reweight_of_an_unreported_subject":
-        # alice filed nothing about this subject, so no weight change to it
-        # was ever owed, even though she really was enfranchised.
+        # alice filed nothing about this subject, so none was owed.
         reweight.subject = "a-seller-alice-never-rated"
 
     stage = reputation_capped(Trace(events))
@@ -485,3 +472,101 @@ def test_a_subscriber_may_still_emit_other_kinds():
     engine.layers["payments"].transfer("alice", "bob", 1, "one-cent")
     assert [e.kind for e in engine.events if e.kind == "reputation_reweighted"]
     assert engine._dispatching == set()
+
+
+# -- review follow-ups on 9dc2113 ---------------------------------------
+
+
+def test_an_enfranchised_slanderer_fails_honest_signal_survives():
+    """A reweight moves a score, so the stage must read reweights too."""
+    spec = load_bundled("capped_influence")
+    engine = build_engine(spec)
+    engine.schedule(10.0, lambda: engine.layers["payments"].transfer(
+        "buyer-1", "slanderer", 1, "one-cent-to-slanderer"))
+    engine.run()
+
+    assert engine.layers["trust"].score("seller-honest") == 0
+    reweights = [e for e in engine.events if e.kind == "reputation_reweighted"]
+    assert [(e.observer, e.detail["score_before"], e.detail["score"])
+            for e in reweights] == [("slanderer", 1, 0)]
+
+    result = evaluate_scenario(spec, engine.run_id, engine.events)
+    stages = {s.name: s.status for s in result.stages}
+    assert stages["influence_capped"] == "passed", "the cap itself held"
+    assert stages["honest_signal_survives"] == "failed"
+    assert result.verdict == "failed"
+
+
+def paid(engine, payer, payee, cents, memo):
+    engine.layers["payments"].transfer(payer, payee, cents, memo)
+
+
+def three_party_engine():
+    spec = load_bundled("capped_influence")
+    engine = Engine(spec)
+    for who in ("alice", "bob", "carol", "seller"):
+        engine.layers["identity"].create(who)
+    engine.layers["payments"].open_account("alice", 10)
+    engine.layers["payments"].open_account("bob", 10)
+    engine.layers["payments"].open_account("carol", 0)
+    return engine
+
+
+@pytest.mark.parametrize("case", ["late_payment", "two_paid_raters"])
+def test_a_missing_receipt_is_incomplete_evidence_not_a_broken_cap(case):
+    """Absent attribution must not desynchronise the arithmetic beneath it."""
+    engine = three_party_engine()
+    if case == "late_payment":
+        TownAPI(engine, "alice").rate("seller", "bad")
+        paid(engine, "alice", "bob", 1, "c1")
+        TownAPI(engine, "bob").rate("seller", "good")
+    else:
+        paid(engine, "alice", "carol", 1, "c2")
+        paid(engine, "bob", "carol", 1, "c3")
+        TownAPI(engine, "alice").rate("seller", "good")
+        TownAPI(engine, "bob").rate("seller", "good")
+
+    events = [event.model_copy(deep=True) for event in engine.events]
+    assert reputation_capped(Trace(events)).status == "passed"
+    events.remove(next(e for e in events if e.kind == "receipt_attested"
+                       and e.observer == "alice"))
+    assert reputation_capped(Trace(events)).status == "not_enough_evidence"
+
+
+def test_a_real_arithmetic_error_survives_a_missing_receipt():
+    """Incomplete evidence must not become cover for a genuine mismatch."""
+    engine = three_party_engine()
+    paid(engine, "alice", "carol", 1, "c2")
+    paid(engine, "bob", "carol", 1, "c3")
+    TownAPI(engine, "alice").rate("seller", "good")
+    TownAPI(engine, "bob").rate("seller", "good")
+    events = [event.model_copy(deep=True) for event in engine.events]
+    events.remove(next(e for e in events if e.kind == "receipt_attested"
+                       and e.observer == "alice"))
+    last = [e for e in events if e.kind == "reputation_updated"][-1]
+    last.detail["score"] = 99
+    assert reputation_capped(Trace(events)).status == "failed"
+
+
+def test_a_plugin_may_emit_from_its_own_constructor():
+    """Dispatch state must exist before any layer is built."""
+    from nandatown.layers import register
+
+    @register("memory", "emits_on_init.v1")
+    class EmitsOnInit:
+        def __init__(self, engine):
+            self.engine = engine
+            engine.emit("town", "plugin_ready", "emits_on_init.v1", {})
+
+        def remember(self, *args):
+            pass
+
+        def recall(self, *args):
+            return None
+
+    spec = load_bundled("capped_influence")
+    spec.layers["memory"] = "emits_on_init.v1"
+    engine = Engine(spec)
+    assert [e.kind for e in engine.events] == ["plugin_ready"]
+    # subscriptions are still wired afterwards
+    assert set(engine._subscribers) == {"payment_settled"}

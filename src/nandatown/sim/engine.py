@@ -32,18 +32,19 @@ class Engine:
         self.events: list[TownEvent] = []
         self.intents: list[dict[str, Any]] = []
         self.agents: dict[str, Any] = {}
+        # Set first: a plugin may emit from its own constructor.
+        self._subscribers: dict[str, list[tuple[str, Any]]] = {}
+        self._dispatching: set[tuple[str, str]] = set()
         self.layers = {name: resolve(name, spec.layers[name])(self)
                        for name in LAYER_NAMES}
         # A layer reacts to another layer's events by naming the kinds it
         # wants in subscribes_to and defining on_event.
-        self._subscribers: dict[str, list[tuple[str, Any]]] = {}
         for name, layer in self.layers.items():
             notify = getattr(layer, "on_event", None)
             if not callable(notify):
                 continue
             for kind in getattr(layer, "subscribes_to", ()):
                 self._subscribers.setdefault(kind, []).append((name, notify))
-        self._dispatching: set[tuple[str, str]] = set()
         self.layers["transport"].configure(
             [f.model_dump() for f in spec.faults])
         self.layers["privacy"].configure(spec.redact_fields)

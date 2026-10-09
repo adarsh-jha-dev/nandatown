@@ -499,6 +499,26 @@ def reputation_capped(trace: Trace) -> StageResult:
             return _failed("influence_capped", [event.event_id],
                            "one receipt was counted more than once")
         used.add(record_id)
+
+        # Applied before its receipt is resolved: skipping the arithmetic
+        # when one is absent desynchronises every later score.
+        observer, subject = event.observer, event.subject
+        if observer in settled:
+            weights.setdefault(observer, 1)
+        subjects = net.setdefault(observer, {})
+        subjects[subject] = subjects.get(subject, 0) + (
+            1 if outcome == "good" else -1)
+
+        refs = [event.event_id]
+        expected = recomputed(subject)
+        if detail["score"] != expected or detail["delta"] != (
+                expected - scores.get(subject, 0)):
+            return _failed(
+                "influence_capped", refs,
+                f"recorded score {detail['score']:+d} does not match the"
+                f" capped formula's {expected:+d}")
+        scores[subject] = expected
+
         matches = receipts.get(record_id, [])
         if not matches:
             missing_receipt = True
@@ -519,22 +539,6 @@ def reputation_capped(trace: Trace) -> StageResult:
                 "influence_capped", refs,
                 "score update does not match a prior attributed trade"
                 " receipt")
-
-        observer, subject = event.observer, event.subject
-        if observer in settled:
-            weights.setdefault(observer, 1)
-        subjects = net.setdefault(observer, {})
-        subjects[subject] = subjects.get(subject, 0) + (
-            1 if outcome == "good" else -1)
-
-        expected = recomputed(subject)
-        if detail["score"] != expected or detail["delta"] != (
-                expected - scores.get(subject, 0)):
-            return _failed(
-                "influence_capped", refs,
-                f"recorded score {detail['score']:+d} does not match the"
-                f" capped formula's {expected:+d}")
-        scores[subject] = expected
         evidence.extend(refs)
 
     if owed:
@@ -573,8 +577,11 @@ def capped_influence(spec, trace: Trace) -> list[StageResult]:
 
     stages.append(reputation_capped(trace))
 
+    # Both kinds move a score.
     final: dict[str, int] = {}
-    for event in trace.find("reputation_updated"):
+    scoring = [event for event in trace.events
+               if event.kind in ("reputation_updated", REWEIGHT_KIND)]
+    for event in scoring:
         detail = event.detail if isinstance(event.detail, dict) else {}
         if isinstance(event.subject, str) and type(detail.get("score")) is int:
             final[event.subject] = detail["score"]
@@ -583,7 +590,7 @@ def capped_influence(spec, trace: Trace) -> list[StageResult]:
     surviving = [name for name in honest if final.get(name, 0) > 0]
     stages.append(_check(
         "honest_signal_survives", len(surviving) == len(honest) and bool(honest),
-        trace.ids("reputation_updated"),
+        _event_ids(scoring),
         "the slandered seller must keep a positive score from the buyer it"
         " actually traded with; capping abuse must not silence real feedback"))
 
